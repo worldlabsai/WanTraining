@@ -1,0 +1,11 @@
+diffusers
+transformers
+accelerate
+bitsandbytes
+decord
+peft
+easydict
+ftfy
+
+# flash_attn
+# tensorboard
