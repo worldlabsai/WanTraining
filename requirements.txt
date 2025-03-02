@@ -6,6 +6,5 @@ decord
 peft
 easydict
 ftfy
-
+tensorboard
 # flash_attn
-# tensorboard

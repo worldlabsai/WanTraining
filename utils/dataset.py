@@ -15,7 +15,7 @@ IMAGE_TYPES = [".jpg", ".png"]
 VIDEO_TYPES = [".mp4", ".mkv", ".mov", ".avi", ".webm"]
 
 
-BUCKET_RESOLUTIONS_640 = {
+BUCKET_RESOLUTIONS_624 = {
     "16x9": (832, 480),
     "4x3":  (704, 544),
     "1x1":  (624, 624),
@@ -56,7 +56,7 @@ class CombinedDataset(Dataset):
         token_limit = 10_000,
         limit_samples = None,
         max_frame_stride = 4,
-        bucket_resolution = 640
+        bucket_resolution = 624,
     ):
         self.root_folder = root_folder
         self.token_limit = token_limit
@@ -65,7 +65,7 @@ class CombinedDataset(Dataset):
         if bucket_resolution == 960:
             self.bucket_resolution = BUCKET_RESOLUTIONS_960
         else:
-            self.bucket_resolution = BUCKET_RESOLUTIONS_640
+            self.bucket_resolution = BUCKET_RESOLUTIONS_624
         
         # search for all files matching image or video extensions
         self.media_files = []
@@ -100,13 +100,13 @@ class CombinedDataset(Dataset):
         if ext in IMAGE_TYPES:
             image = Image.open(self.media_files[idx]).convert('RGB')
             pixels = torch.as_tensor(np.array(image)).unsqueeze(0) # FHWC
-            width, height = get_resolution(pixels.shape[2], pixels.shape[1], self.bucket_resolution):
+            width, height = get_resolution(pixels.shape[2], pixels.shape[1], self.bucket_resolution)
         else:
             vr = decord.VideoReader(self.media_files[idx])
             orig_height, orig_width = vr[0].shape[:2]
             orig_frames = len(vr)
             
-            width, height = get_resolution(orig_width, orig_height, self.bucket_resolution):
+            width, height = get_resolution(orig_width, orig_height, self.bucket_resolution)
             max_frames = self.find_max_frames(width, height)
             stride = max(min(random.randint(1, self.max_frame_stride), orig_frames // max_frames), 1)
             
