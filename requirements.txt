@@ -7,4 +7,5 @@ peft
 easydict
 ftfy
 tensorboard
+einops
 # flash_attn

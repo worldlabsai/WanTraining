@@ -1,14 +1,24 @@
+import torch
+from torch.utils.data import Dataset
+
+if torch.cuda.is_available():
+    device = torch.cuda.current_device()
+    torch.cuda.init()
+    torch.backends.cuda.matmul.allow_tf32 = True
+else:
+    raise Exception("unable to initialize CUDA")
+
 import os
 import random
 import numpy as np
-import decord
 from glob import glob
 from PIL import Image
 
-import torch
-from torch.utils.data import Dataset
 from torchvision.transforms import v2, InterpolationMode
 from safetensors.torch import load_file
+
+import decord
+decord.bridge.set_bridge('torch')
 
 
 IMAGE_TYPES = [".jpg", ".png"]
