@@ -136,12 +136,14 @@ def cache_embeddings(args):
         embedding_path = os.path.splitext(file)[0] + "_wan.safetensors"
         
         if not os.path.exists(embedding_path):
-            with open(file, "r") as f:
-                caption = f.read()
-            
-            context = umt5_model([caption], umt5_model.device)[0]
-            embedding_dict = {"context": context}
-            save_file(embedding_dict, embedding_path)
+            try:
+                with open(file, "r", encoding="utf-8") as f:
+                    caption = f.read()
+                    context = umt5_model([caption], umt5_model.device)[0]
+                    embedding_dict = {"context": context}
+                    save_file(embedding_dict, embedding_path)
+            except UnicodeDecodeError as e:
+                tqdm.write(f"unable to decode {file}: UnicodeDecodeError: {e}")
     
     del umt5_model
     gc.collect()
@@ -256,8 +258,8 @@ def main(args):
                 if args.lora_target in name and ".norm_" not in name:
                     lora_params.append(name.replace(".weight", ""))
     
-    elif args.lora_target == "all-linear":
-        lora_params = args.lora_target
+    # elif args.lora_target == "all-linear":
+        # lora_params = args.lora_target
     
     else: raise NotImplementedError(f"{args.lora_target}")
     
@@ -267,7 +269,7 @@ def main(args):
         init_lora_weights = "gaussian",
         target_modules = lora_params,
     )
-    diffusion_model.add_adapter(lora_config)
+    diffusion_model.add_adapter(lora_config, adapter_name="default")
     
     if args.init_lora is not None:
         loaded_lora_sd = load_file(args.init_lora)
@@ -299,6 +301,7 @@ def main(args):
     for p in train_parameters:
         p.register_post_accumulate_grad_hook(optimizer_hook)
     
+    context_negative = load_file(args.distill_negative)["context"].to(dtype=torch.bfloat16, device=device)
     
     def prepare_conditions(batch):
         pixels  = [p.to(dtype=torch.bfloat16, device=device) for p in batch[0]]
@@ -324,21 +327,52 @@ def main(args):
             "noisy_model_input": noisy_model_input,
         }
     
-    def predict_loss(conditions):
-        target = conditions["target"]
+    def predict_loss(conditions, log_cfg_loss=False):
+        target = torch.stack(conditions["target"])
         c, f, h, w = conditions["noisy_model_input"][0].shape
         seq_len = math.ceil((h / 2) * (w / 2) * f)
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred = diffusion_model(
-                x = conditions["noisy_model_input"],
-                t = conditions["timesteps"],
-                context = conditions["context"],
-                seq_len = seq_len,
+            pred = torch.stack(
+                diffusion_model(
+                    x = conditions["noisy_model_input"],
+                    t = conditions["timesteps"],
+                    context = conditions["context"],
+                    seq_len = seq_len,
+                )
             )
+            
+            if args.distill_cfg > 0:
+                with torch.no_grad():
+                    diffusion_model.set_adapters(adapter_names="default", weights=0.0)
+                    
+                    base_pred_cond = torch.stack(
+                        diffusion_model(
+                            x = conditions["noisy_model_input"],
+                            t = conditions["timesteps"],
+                            context = conditions["context"],
+                            seq_len = seq_len,
+                        )
+                    )
+                    
+                    base_pred_uncond = torch.stack(
+                        diffusion_model(
+                            x = conditions["noisy_model_input"],
+                            t = conditions["timesteps"],
+                            context = [context_negative] * len(conditions["noisy_model_input"]),
+                            seq_len = seq_len,
+                        )
+                    )
+                    
+                    diffusion_model.set_adapters(adapter_names="default", weights=1.0)
+                    
+                    if log_cfg_loss:
+                        cfg_loss = F.mse_loss(pred, base_pred_cond)
+                        t_writer.add_scalar("loss/cfg", cfg_loss.item(), global_step)
+                
+                    target += args.distill_cfg * (base_pred_cond - base_pred_uncond)
         
-        # loss = torch.stack([F.mse_loss(p, t) for p, t in zip(pred, target)])
-        return F.mse_loss(torch.stack(pred), torch.stack(target))
+        return F.mse_loss(pred, target)
     
     gc.collect()
     torch.cuda.empty_cache()
@@ -353,7 +387,7 @@ def main(args):
                 conditions = prepare_conditions(batch)
             
             # torch.cuda.empty_cache()
-            loss = predict_loss(conditions)
+            loss = predict_loss(conditions, log_cfg_loss=True)
             t_writer.add_scalar("loss/train", loss.detach().item(), global_step)
             loss.backward()
             
@@ -409,7 +443,7 @@ def parse_args():
         "--output_dir",
         type = str,
         default = "./outputs",
-        help = "Output directory for training results"
+        help = "Output directory for training results",
     )
     parser.add_argument(
         "--dataset",
@@ -421,13 +455,13 @@ def parse_args():
         "--val_samples",
         type = int,
         default = 4,
-        help = "Maximum number of samples to use for validation loss"
+        help = "Maximum number of samples to use for validation loss",
     )
     parser.add_argument(
         "--seed",
         type = int,
         default = 42,
-        help = "Seed for reproducible training"
+        help = "Seed for reproducible training",
     )
     parser.add_argument(
         "--fuse_lora",
@@ -452,7 +486,7 @@ def parse_args():
         type = str,
         default = "attn",
         choices=["attn", "all-linear"],
-        help = "layers to target with LoRA, default is attention only"
+        help = "layers to target with LoRA, default is attention only",
     )
     parser.add_argument(
         "--lora_rank",
@@ -478,23 +512,35 @@ def parse_args():
         help = "Base learning rate",
     )
     parser.add_argument(
+        "--distill_cfg",
+        type = float,
+        default = 0.0,
+        help = "CFG scale to use for distillation, 0=disabled",
+    )
+    parser.add_argument(
+        "--distill_negative",
+        type = str,
+        default = "./embeddings/default_video_negative_wan.safetensors",
+        help = "Precalculated embedding file to use as negative prompt for CFG distillation",
+    )
+    parser.add_argument(
         "--base_res",
         type = int,
         default = 624,
         choices=[624, 960],
-        help = "Base resolution bucket, resized to equal area based on aspect ratio"
+        help = "Base resolution bucket, resized to equal area based on aspect ratio",
     )
     parser.add_argument(
         "--token_limit",
         type = int,
-        default = 15_000,
-        help = "Combined resolution/frame limit based on transformer patch sequence length: (width // 16) * (height // 16) * ((frames - 1) // 4 + 1)"
+        default = 10_000,
+        help = "Combined resolution/frame limit based on transformer patch sequence length: (width // 16) * (height // 16) * ((frames - 1) // 4 + 1)",
     )
     parser.add_argument(
         "--max_frame_stride",
         type = int,
         default = 2,
-        help = "1: use native framerate only. Higher values allow randomly choosing lower framerates (skipping frames to speed up the video)"
+        help = "1: use native framerate only. Higher values allow randomly choosing lower framerates (skipping frames to speed up the video)",
     )
     parser.add_argument(
         "--val_steps",
@@ -511,7 +557,7 @@ def parse_args():
     parser.add_argument(
         "--max_train_steps",
         type = int,
-        default = 10_000,
+        default = 1_000,
         help = "Total number of training steps",
     )
     

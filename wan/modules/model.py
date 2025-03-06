@@ -4,15 +4,20 @@ import math
 import torch
 import torch.amp as amp
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import PeftAdapterMixin
+from diffusers.utils import set_weights_and_activate_adapters
 
 # from .attention import flash_attention
 from .attention import attention
 
 __all__ = ['WanModel']
 
+_SET_ADAPTER_SCALE_FN_MAPPING = {
+    "WanModel": lambda model_cls, weights: weights,
+}
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
@@ -370,6 +375,8 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     ]
     _no_split_modules = ['WanAttentionBlock']
 
+    _supports_gradient_checkpointing = True
+
     @register_to_config
     def __init__(self,
                  model_type='t2v',
@@ -480,6 +487,41 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         # initialize weights
         self.init_weights()
+        
+        self.gradient_checkpointing = False
+
+    def set_adapters(
+        self,
+        adapter_names,
+        weights = None,
+    ):
+        adapter_names = [adapter_names] if isinstance(adapter_names, str) else adapter_names
+
+        # Expand weights into a list, one entry per adapter
+        # examples for e.g. 2 adapters:  [{...}, 7] -> [7,7] ; None -> [None, None]
+        if not isinstance(weights, list):
+            weights = [weights] * len(adapter_names)
+
+        if len(adapter_names) != len(weights):
+            raise ValueError(
+                f"Length of adapter names {len(adapter_names)} is not equal to the length of their weights {len(weights)}."
+            )
+
+        # Set None values to default of 1.0
+        # e.g. [{...}, 7] -> [{...}, 7] ; [None, None] -> [1.0, 1.0]
+        weights = [w if w is not None else 1.0 for w in weights]
+
+        # e.g. [{...}, 7] -> [{expanded dict...}, 7]
+        scale_expansion_fn = _SET_ADAPTER_SCALE_FN_MAPPING[self.__class__.__name__]
+        weights = scale_expansion_fn(self, weights)
+
+        set_weights_and_activate_adapters(self, adapter_names, weights)
+
+    def enable_gradient_checkpointing(self):
+        self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -563,7 +605,12 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context_lens=context_lens)
 
         for block in self.blocks:
-            x = block(x, **kwargs)
+            # if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if x.requires_grad and self.gradient_checkpointing:
+                # x = checkpoint.checkpoint(lambda inp: block(inp, **kwargs), x)
+                x = checkpoint.checkpoint(lambda inp: block(inp, **kwargs), x, use_reentrant=True)
+            else:
+                x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)
