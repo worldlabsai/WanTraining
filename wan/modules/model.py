@@ -605,10 +605,8 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context_lens=context_lens)
 
         for block in self.blocks:
-            # if torch.is_grad_enabled() and self.gradient_checkpointing:
             if x.requires_grad and self.gradient_checkpointing:
-                # x = checkpoint.checkpoint(lambda inp: block(inp, **kwargs), x)
-                x = checkpoint.checkpoint(lambda inp: block(inp, **kwargs), x, use_reentrant=True)
+                x = checkpoint.checkpoint(lambda inp: block(inp, **kwargs), x, use_reentrant=False)
             else:
                 x = block(x, **kwargs)
 

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 if torch.cuda.is_available():
@@ -67,10 +68,12 @@ class CombinedDataset(Dataset):
         limit_samples = None,
         max_frame_stride = 4,
         bucket_resolution = 624,
+        control_type = None,
     ):
         self.root_folder = root_folder
         self.token_limit = token_limit
         self.max_frame_stride = max_frame_stride
+        self.control_type = control_type
         
         if bucket_resolution == 960:
             self.bucket_resolution = BUCKET_RESOLUTIONS_960
@@ -151,6 +154,17 @@ class CombinedDataset(Dataset):
         pixels = transform(pixels) * 2 - 1
         pixels = torch.clamp(torch.nan_to_num(pixels), min=-1, max=1)
         
+        if self.control_type == "tile":
+            blur = v2.Compose([
+                v2.Resize(size=(height // 4, width // 4)),
+                v2.Resize(size=(height, width)),
+                v2.GaussianBlur(kernel_size=15, sigma=4),
+            ])
+            control = blur(pixels)
+            control = torch.clamp(torch.nan_to_num(control), min=-1, max=1)
+        else:
+            control = None
+        
         # load precomputed text embeddings from file
         embedding_file = os.path.splitext(self.media_files[idx])[0] + "_wan.safetensors"
         if not os.path.exists(embedding_file):
@@ -164,4 +178,4 @@ class CombinedDataset(Dataset):
         else:
             raise Exception(f"No embedding file found for {self.media_files[idx]}, you may need to precompute embeddings with --cache_embeddings")
         
-        return {"pixels": pixels, "embedding_dict": embedding_dict}
+        return {"pixels": pixels, "embedding_dict": embedding_dict, "control": control}

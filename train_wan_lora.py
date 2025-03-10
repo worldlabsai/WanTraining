@@ -186,6 +186,7 @@ def main(args):
             token_limit = args.token_limit,
             max_frame_stride = args.max_frame_stride,
             bucket_resolution = args.base_res,
+            control_type = args.control_type if args.control_lora else None,
         )
     with load_timer("validation dataset"):
         val_dataset = CombinedDataset(
@@ -194,12 +195,14 @@ def main(args):
             limit_samples = args.val_samples,
             max_frame_stride = args.max_frame_stride,
             bucket_resolution = args.base_res,
+            control_type = args.control_type if args.control_lora else None,
         )
     
     def collate_batch(batch):
         pixels = [sample["pixels"][0].movedim(0, 1) for sample in batch] # BFCHW -> FCHW -> CFHW
         context = [sample["embedding_dict"]["context"] for sample in batch]
-        return pixels, context
+        control = [sample["control"][0].movedim(0, 1) for sample in batch] if args.control_lora else None
+        return pixels, context, control
     
     train_dataloader = DataLoader(
         train_dataset,
@@ -244,6 +247,28 @@ def main(args):
         gc.collect()
         torch.cuda.empty_cache()
     
+    if args.control_lora:
+        with torch.no_grad():
+            in_cls = diffusion_model.patch_embedding.__class__ # nn.Conv3d
+            old_in_dim = diffusion_model.in_dim # 16
+            new_in_dim = old_in_dim * 2
+            
+            new_in = in_cls(
+                new_in_dim,
+                diffusion_model.patch_embedding.out_channels,
+                diffusion_model.patch_embedding.kernel_size,
+                diffusion_model.patch_embedding.stride,
+                diffusion_model.patch_embedding.padding,
+            ).to(device=device, dtype=torch.bfloat16)
+            
+            new_in.weight.zero_()
+            new_in.bias.zero_()
+            
+            new_in.weight[:, :old_in_dim].copy_(diffusion_model.patch_embedding.weight)
+            new_in.bias.copy_(diffusion_model.patch_embedding.bias)
+            
+            diffusion_model.patch_embedding = new_in
+            diffusion_model.register_to_config(in_dim=new_in_dim)
     
     if args.fuse_lora is not None:
         loaded_lora_sd = load_file(args.fuse_lora)
@@ -251,15 +276,17 @@ def main(args):
         diffusion_model.fuse_lora(adapter_names="fuse_lora", lora_scale=args.fuse_lora_weight, safe_fusing=True)
         diffusion_model.unload_lora_weights()
     
+    lora_params = []
+    if args.control_lora:
+        lora_params.append("patch_embedding")
+    
     if args.lora_target == "attn":
-        lora_params = []
         for name, param in diffusion_model.named_parameters():
             if name.endswith(".weight"):
                 if args.lora_target in name and ".norm_" not in name:
                     lora_params.append(name.replace(".weight", ""))
     
     # elif args.lora_target == "all-linear":
-        # lora_params = args.lora_target
     
     else: raise NotImplementedError(f"{args.lora_target}")
     
@@ -277,20 +304,26 @@ def main(args):
         if len(outcome.unexpected_keys) > 0:
             for key in outcome.unexpected_keys:
                 print(f"not loaded: {key}")
+            exit()
+        else:
+            print("init lora loaded successfully, all keys matched")
     
     
-    train_parameters = []
     total_parameters = 0
-    for param in diffusion_model.parameters():
+    train_parameters = []
+    
+    for name, param in diffusion_model.named_parameters():
         if param.requires_grad:
             param.data = param.to(torch.float32)
-            train_parameters.append(param)
+            lr = args.learning_rate * 10 if "patch_embedding" in name else args.learning_rate
+            train_parameters.append((param, lr))
             total_parameters += param.numel()
+    
     print(f"total trainable parameters: {total_parameters:,}")
     
     # Instead of having just one optimizer, we will have a dict of optimizers
     # for every parameter so we could reference them in our hook.
-    optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=args.learning_rate) for p in train_parameters}
+    optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=lr) for p, lr in train_parameters}
     
     # Define our hook, which will call the optimizer step() and zero_grad()
     def optimizer_hook(parameter) -> None:
@@ -298,14 +331,25 @@ def main(args):
         optimizer_dict[parameter].zero_grad()
     
     # Register the hook onto every trainable parameter
-    for p in train_parameters:
+    for p, _ in train_parameters:
         p.register_post_accumulate_grad_hook(optimizer_hook)
     
     context_negative = load_file(args.distill_negative)["context"].to(dtype=torch.bfloat16, device=device)
     
     def prepare_conditions(batch):
-        pixels  = [p.to(dtype=torch.bfloat16, device=device) for p in batch[0]]
-        context = [c.to(dtype=torch.bfloat16, device=device) for c in batch[1]]
+        pixels, context, control = batch
+        
+        pixels  = [p.to(dtype=torch.bfloat16, device=device) for p in pixels]
+        context = [c.to(dtype=torch.bfloat16, device=device) for c in context]
+        
+        if control is not None:
+            control = [p.to(dtype=torch.bfloat16, device=device) for p in control]
+            control_latents = vae.encode(control)
+            
+            if args.control_inject_noise > 0:
+                for i in range(len(control_latents)):
+                    inject_strength = torch.rand(1).item() * args.control_inject_noise
+                    control_latents[i] += torch.randn_like(control_latents[i]) * inject_strength
         
         latents = vae.encode(pixels)
         noise = [torch.randn_like(l) for l in latents]
@@ -318,6 +362,10 @@ def main(args):
         for i in range(len(latents)):
             target.append(noise[i] - latents[i])
             noisy = noise[i] * sigmas[i] + latents[i] * (1 - sigmas[i])
+            
+            if control is not None:
+                noisy = torch.cat([noisy, control_latents[i]], dim=0) # CFHW, so channel dim is 0
+            
             noisy_model_input.append(noisy.to(torch.bfloat16))
         
         return {
@@ -372,6 +420,7 @@ def main(args):
                 
                     target += args.distill_cfg * (base_pred_cond - base_pred_uncond)
         
+        assert not torch.isnan(pred).any()
         return F.mse_loss(pred, target)
     
     gc.collect()
@@ -397,7 +446,7 @@ def main(args):
             global_step += 1
             
             if global_step == 1 or global_step % args.val_steps == 0:
-                with torch.inference_mode(), temp_rng(args.seed):
+                with torch.inference_mode(), temp_rng(args.val_seed or args.seed):
                     val_loss = 0.0
                     for step, batch in enumerate(tqdm(val_dataloader, desc="validation", leave=False)):
                         conditions = prepare_conditions(batch)
@@ -420,7 +469,7 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description = "HunyuanVideo training script",
+        description = "Wan2.1 lora training script",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -464,6 +513,12 @@ def parse_args():
         help = "Seed for reproducible training",
     )
     parser.add_argument(
+        "--val_seed",
+        type = int,
+        default = None,
+        help = "Optional separate seed for validation, to have consistent validation rng when changing training seed",
+    )
+    parser.add_argument(
         "--fuse_lora",
         type = str,
         default = None,
@@ -487,6 +542,24 @@ def parse_args():
         default = "attn",
         choices=["attn", "all-linear"],
         help = "layers to target with LoRA, default is attention only",
+    )
+    parser.add_argument(
+        "--control_lora",
+        action = "store_true",
+        help = "Train lora as control lora (extra input channels)",
+    )
+    parser.add_argument(
+        "--control_type",
+        type = str,
+        default = "tile",
+        choices=["tile",],
+        help = "Input signal if training as control lora, tile = blurred video for upscaling",
+    )
+    parser.add_argument(
+        "--control_inject_noise",
+        type = float,
+        default = 0.0,
+        help = "Add noise to the control latents, at a random strength up to this amount",
     )
     parser.add_argument(
         "--lora_rank",

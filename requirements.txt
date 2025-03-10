@@ -9,3 +9,5 @@ ftfy
 tensorboard
 einops
 # flash_attn
+imageio
+imageio-ffmpeg
