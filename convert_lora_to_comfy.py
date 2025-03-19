@@ -33,7 +33,21 @@ if __name__ == "__main__":
     original_lora_sd = load_file(args.input_lora)
     converted_lora_sd = {}
     for key in original_lora_sd.keys():
-        converted_lora_sd["diffusion_model." + key] = original_lora_sd[key]
+        new_key = "diffusion_model." + key
+        
+        if "patch_embedding.lora_A" in new_key:
+            print("control lora detected")
+            
+            new_ch = original_lora_sd[key].shape[1] # 32
+            model_dim = original_lora_sd[key.replace(".lora_A.weight", ".lora_B.weight")].shape[0]
+            
+            reshape_weight = torch.tensor([model_dim, new_ch, 1, 2, 2])
+            reshape_key = new_key.replace(".lora_A.weight", ".reshape_weight")
+            converted_lora_sd[reshape_key] = reshape_weight
+            
+            print(f"added reshape_weight for {reshape_key}: {reshape_weight}")
+        
+        converted_lora_sd[new_key] = original_lora_sd[key]
     
     if args.alpha is not None:
         for key in list(converted_lora_sd.keys()):

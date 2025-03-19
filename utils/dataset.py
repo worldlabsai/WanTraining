@@ -68,12 +68,14 @@ class CombinedDataset(Dataset):
         limit_samples = None,
         max_frame_stride = 4,
         bucket_resolution = 624,
-        control_type = None,
+        load_control = False,
+        control_suffix = "",
     ):
         self.root_folder = root_folder
         self.token_limit = token_limit
         self.max_frame_stride = max_frame_stride
-        self.control_type = control_type
+        self.load_control = load_control
+        self.control_suffix = control_suffix
         
         if bucket_resolution == 960:
             self.bucket_resolution = BUCKET_RESOLUTIONS_960
@@ -154,14 +156,8 @@ class CombinedDataset(Dataset):
         pixels = transform(pixels) * 2 - 1
         pixels = torch.clamp(torch.nan_to_num(pixels), min=-1, max=1)
         
-        if self.control_type == "tile":
-            blur = v2.Compose([
-                v2.Resize(size=(height // 4, width // 4)),
-                v2.Resize(size=(height, width)),
-                v2.GaussianBlur(kernel_size=15, sigma=4),
-            ])
-            control = blur(pixels)
-            control = torch.clamp(torch.nan_to_num(control), min=-1, max=1)
+        if self.load_control:
+            raise NotImplementedError("loading control files from disk is not implemented yet")
         else:
             control = None
         

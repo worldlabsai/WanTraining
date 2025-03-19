@@ -11,3 +11,4 @@ einops
 # flash_attn
 imageio
 imageio-ffmpeg
+opencv-python

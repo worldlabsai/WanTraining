@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from time import perf_counter
 from glob import glob
 
+from torchvision.transforms import v2, InterpolationMode
 from safetensors.torch import load_file, save_file
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
@@ -186,7 +187,8 @@ def main(args):
             token_limit = args.token_limit,
             max_frame_stride = args.max_frame_stride,
             bucket_resolution = args.base_res,
-            control_type = args.control_type if args.control_lora else None,
+            load_control = args.load_control,
+            control_suffix = args.control_suffix,
         )
     with load_timer("validation dataset"):
         val_dataset = CombinedDataset(
@@ -195,13 +197,14 @@ def main(args):
             limit_samples = args.val_samples,
             max_frame_stride = args.max_frame_stride,
             bucket_resolution = args.base_res,
-            control_type = args.control_type if args.control_lora else None,
+            load_control = args.load_control,
+            control_suffix = args.control_suffix,
         )
     
     def collate_batch(batch):
         pixels = [sample["pixels"][0].movedim(0, 1) for sample in batch] # BFCHW -> FCHW -> CFHW
         context = [sample["embedding_dict"]["context"] for sample in batch]
-        control = [sample["control"][0].movedim(0, 1) for sample in batch] if args.control_lora else None
+        control = [sample["control"][0].movedim(0, 1) for sample in batch] if args.load_control else None
         return pixels, context, control
     
     train_dataloader = DataLoader(
@@ -314,8 +317,10 @@ def main(args):
     
     for name, param in diffusion_model.named_parameters():
         if param.requires_grad:
+            lr = args.learning_rate
+            if "patch_embedding" in name:
+                lr *= args.input_lr_scale
             param.data = param.to(torch.float32)
-            lr = args.learning_rate * 10 if "patch_embedding" in name else args.learning_rate
             train_parameters.append((param, lr))
             total_parameters += param.numel()
     
@@ -336,14 +341,73 @@ def main(args):
     
     context_negative = load_file(args.distill_negative)["context"].to(dtype=torch.bfloat16, device=device)
     
+    if args.control_lora and args.control_preprocess == "depth":
+        if not os.path.exists("./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth"):
+            print("depth model not found, downloading to ./models/Depth-Anything-V2-Small")
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_type = "model",
+                repo_id = "depth-anything/Depth-Anything-V2-Small",
+                local_dir = "./models/Depth-Anything-V2-Small",
+                allow_patterns = "*.pth",
+            )
+        
+        from utils.depth_anything_v2.dpt import DepthAnythingV2
+        depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
+        depth_model.load_state_dict(torch.load("./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth", map_location='cpu', weights_only=True))
+        depth_model = depth_model.to(device)
+        depth_model.requires_grad_(False)
+        depth_model.eval()
+    
+    def preprocess_control(pixels):
+        if args.control_preprocess == "tile":
+            control = pixels.movedim(0, 1).unsqueeze(0) # CFHW -> BFCHW
+            height, width = control.shape[-2:]
+            
+            blur = v2.Compose([
+                v2.Resize(size=(height // 4, width // 4)),
+                v2.Resize(size=(height, width)),
+                v2.GaussianBlur(kernel_size=15, sigma=random.uniform(3, 6)),
+            ])
+            
+            control = torch.clamp(torch.nan_to_num(blur(control)), min=-1, max=1)
+            control = control[0].movedim(0, 1) # BFCHW -> CFHW
+        
+        elif args.control_preprocess == "depth":
+            depth_frames = []
+            for i in range(pixels.shape[1]):
+                d_input = pixels[:, i].movedim(0, -1).cpu().float().numpy() * 0.5 + 0.5 # CFHW -> CHW -> HWC
+                depth = depth_model.infer_image(d_input)
+                depth = (depth - depth.min()) / (depth.max() - depth.min()) # normalized to near=1, far=0
+                depth_frames.append(depth * 2 - 1)
+            
+            depth_frames = torch.stack(depth_frames).unsqueeze(0).repeat(3, 1, 1, 1) # HW -> FHW -> CFHW
+            control = depth_frames.to(dtype=torch.bfloat16, device=device)
+        
+        else:
+            raise NotImplementedError(f"{args.control_preprocess}")
+        
+        return control
+    
     def prepare_conditions(batch):
         pixels, context, control = batch
         
         pixels  = [p.to(dtype=torch.bfloat16, device=device) for p in pixels]
         context = [c.to(dtype=torch.bfloat16, device=device) for c in context]
         
-        if control is not None:
-            control = [p.to(dtype=torch.bfloat16, device=device) for p in control]
+        latents = vae.encode(pixels)
+        noise = [torch.randn_like(l) for l in latents]
+        
+        sigmas = torch.rand(len(latents)).to(device)
+        sigmas = (args.shift * sigmas) / (1 + (args.shift - 1) * sigmas)
+        timesteps = torch.round(sigmas * 1000).long()
+        sigmas = timesteps.float() / 1000
+        
+        if args.control_lora:
+            if control is not None:
+                control = [p.to(dtype=torch.bfloat16, device=device) for p in control]
+            else:
+                control = [preprocess_control(p) for p in pixels]
             control_latents = vae.encode(control)
             
             if args.control_inject_noise > 0:
@@ -351,19 +415,13 @@ def main(args):
                     inject_strength = torch.rand(1).item() * args.control_inject_noise
                     control_latents[i] += torch.randn_like(control_latents[i]) * inject_strength
         
-        latents = vae.encode(pixels)
-        noise = [torch.randn_like(l) for l in latents]
-        
-        sigmas = torch.rand(len(latents)).to(device)
-        timesteps = torch.round(sigmas * 1000).long()
-        
         target = []
         noisy_model_input = []
         for i in range(len(latents)):
             target.append(noise[i] - latents[i])
             noisy = noise[i] * sigmas[i] + latents[i] * (1 - sigmas[i])
             
-            if control is not None:
+            if args.control_lora:
                 noisy = torch.cat([noisy, control_latents[i]], dim=0) # CFHW, so channel dim is 0
             
             noisy_model_input.append(noisy.to(torch.bfloat16))
@@ -435,13 +493,11 @@ def main(args):
             with torch.inference_mode():
                 conditions = prepare_conditions(batch)
             
-            # torch.cuda.empty_cache()
             loss = predict_loss(conditions, log_cfg_loss=True)
             t_writer.add_scalar("loss/train", loss.detach().item(), global_step)
             loss.backward()
             
             t_writer.add_scalar("debug/step_time", perf_counter() - start_step, global_step)
-            # torch.cuda.empty_cache()
             progress_bar.update(1)
             global_step += 1
             
@@ -450,10 +506,8 @@ def main(args):
                     val_loss = 0.0
                     for step, batch in enumerate(tqdm(val_dataloader, desc="validation", leave=False)):
                         conditions = prepare_conditions(batch)
-                        # torch.cuda.empty_cache()
                         loss = predict_loss(conditions)
                         val_loss += loss.detach().item()
-                        # torch.cuda.empty_cache()
                     t_writer.add_scalar("loss/validation", val_loss / len(val_dataloader), global_step)
                 progress_bar.unpause()
             
@@ -549,11 +603,22 @@ def parse_args():
         help = "Train lora as control lora (extra input channels)",
     )
     parser.add_argument(
-        "--control_type",
+        "--load_control",
+        action = "store_true",
+        help = "load control files from disk instead of calculating on the fly",
+    )
+    parser.add_argument(
+        "--control_suffix",
+        type = str,
+        default = "_control",
+        help = "suffix to append to video file name (ignoring extension) to get the control video",
+    )
+    parser.add_argument(
+        "--control_preprocess",
         type = str,
         default = "tile",
-        choices=["tile",],
-        help = "Input signal if training as control lora, tile = blurred video for upscaling",
+        choices=["tile", "depth"],
+        help = "Preprocess to apply if not loading a control video",
     )
     parser.add_argument(
         "--control_inject_noise",
@@ -583,6 +648,18 @@ def parse_args():
         type = float,
         default = 1e-5,
         help = "Base learning rate",
+    )
+    parser.add_argument(
+        "--input_lr_scale",
+        type = float,
+        default = 1,
+        help = "Multiplier to learning rate for the input patch_embedding layer if training control lora",
+    )
+    parser.add_argument(
+        "--shift",
+        type = float,
+        default = 3.0,
+        help = "Noise schedule shift for training (shift > 1 will spend more effort on early timesteps/high noise",
     )
     parser.add_argument(
         "--distill_cfg",
