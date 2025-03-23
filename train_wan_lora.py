@@ -341,17 +341,22 @@ def main(args):
     
     # Instead of having just one optimizer, we will have a dict of optimizers
     # for every parameter so we could reference them in our hook.
-    optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=lr) for p, lr in train_parameters}
+    # optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=lr) for p, lr in train_parameters}
+    
+    optimizer = bnb.optim.AdamW8bit(
+        [p for p, _ in train_parameters],
+        lr=args.learning_rate,
+    )
     
     # Define our hook, which will call the optimizer step() and zero_grad()
-    def optimizer_hook(parameter) -> None:
-        optimizer_dict[parameter].step()
-        optimizer_dict[parameter].zero_grad()
+    # def optimizer_hook(parameter) -> None:
+        # optimizer_dict[parameter].step()
+        # optimizer_dict[parameter].zero_grad()
     
     # Register the hook onto every trainable parameter
     for p, _ in train_parameters:
         p.register_hook(lambda grad: torch.clamp(grad, -args.clip_grad, args.clip_grad))
-        p.register_post_accumulate_grad_hook(optimizer_hook)
+        # p.register_post_accumulate_grad_hook(optimizer_hook)
     
     context_negative = load_file(args.distill_negative)["context"].to(dtype=torch.bfloat16, device=device)
     
@@ -452,48 +457,48 @@ def main(args):
         c, f, h, w = conditions["noisy_model_input"][0].shape
         seq_len = math.ceil((h / 2) * (w / 2) * f)
         
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred = torch.stack(
-                diffusion_model(
-                    x = conditions["noisy_model_input"],
-                    t = conditions["timesteps"],
-                    context = conditions["context"],
-                    seq_len = seq_len,
-                )
+        # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        pred = torch.stack(
+            diffusion_model(
+                x = conditions["noisy_model_input"],
+                t = conditions["timesteps"],
+                context = conditions["context"],
+                seq_len = seq_len,
             )
-            
-            if args.distill_cfg > 0:
-                with torch.no_grad():
-                    diffusion_model.set_adapters(adapter_names="default", weights=0.0)
-                    
-                    base_pred_cond = torch.stack(
-                        diffusion_model(
-                            x = conditions["noisy_model_input"],
-                            t = conditions["timesteps"],
-                            context = conditions["context"],
-                            seq_len = seq_len,
-                        )
-                    )
-                    
-                    base_pred_uncond = torch.stack(
-                        diffusion_model(
-                            x = conditions["noisy_model_input"],
-                            t = conditions["timesteps"],
-                            context = [context_negative] * len(conditions["noisy_model_input"]),
-                            seq_len = seq_len,
-                        )
-                    )
-                    
-                    diffusion_model.set_adapters(adapter_names="default", weights=1.0)
-                    
-                    if log_cfg_loss:
-                        cfg_loss = F.mse_loss(pred, base_pred_cond)
-                        t_writer.add_scalar("loss/cfg", cfg_loss.item(), global_step)
+        )
+        
+        if args.distill_cfg > 0:
+            with torch.no_grad():
+                diffusion_model.set_adapters(adapter_names="default", weights=0.0)
                 
-                    target += args.distill_cfg * (base_pred_cond - base_pred_uncond)
+                base_pred_cond = torch.stack(
+                    diffusion_model(
+                        x = conditions["noisy_model_input"],
+                        t = conditions["timesteps"],
+                        context = conditions["context"],
+                        seq_len = seq_len,
+                    )
+                )
+                
+                base_pred_uncond = torch.stack(
+                    diffusion_model(
+                        x = conditions["noisy_model_input"],
+                        t = conditions["timesteps"],
+                        context = [context_negative] * len(conditions["noisy_model_input"]),
+                        seq_len = seq_len,
+                    )
+                )
+                
+                diffusion_model.set_adapters(adapter_names="default", weights=1.0)
+                
+                if log_cfg_loss:
+                    cfg_loss = F.mse_loss(pred, base_pred_cond)
+                    t_writer.add_scalar("loss/cfg", cfg_loss.item(), global_step)
+            
+                target += args.distill_cfg * (base_pred_cond - base_pred_uncond)
         
         assert not torch.isnan(pred).any()
-        return F.mse_loss(pred, target)
+        return F.mse_loss(pred.float(), target.float())
     
     gc.collect()
     torch.cuda.empty_cache()
@@ -510,6 +515,8 @@ def main(args):
             loss = predict_loss(conditions, log_cfg_loss=True)
             t_writer.add_scalar("loss/train", loss.detach().item(), global_step)
             loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
             
             t_writer.add_scalar("debug/step_time", perf_counter() - start_step, global_step)
             progress_bar.update(1)
@@ -672,7 +679,7 @@ def parse_args():
     parser.add_argument(
         "--clip_grad",
         type = float,
-        default = 1.0,
+        default = 100.0,
         help = "Clip gradients at +- this value (at each parameter via hook)",
     )
     parser.add_argument(
