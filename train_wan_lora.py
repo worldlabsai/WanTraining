@@ -283,15 +283,28 @@ def main(args):
     if args.control_lora:
         lora_params.append("patch_embedding")
     
-    if args.lora_target == "attn":
-        for name, param in diffusion_model.named_parameters():
-            if name.endswith(".weight"):
-                if args.lora_target in name and ".norm_" not in name:
-                    lora_params.append(name.replace(".weight", ""))
+    lora_targets = args.lora_targets.replace(" ", "").split(",")
+    lora_blocks = args.lora_blocks.replace(" ", "").split(",") if args.lora_blocks is not None else None
+    for name, param in diffusion_model.named_parameters():
+        if name.endswith(".weight"):
+            for target in lora_targets:
+                if target in name and ".norm_" not in name:
+                    if lora_blocks is None:
+                        lora_params.append(name.replace(".weight", ""))
+                    else:
+                        for block in lora_blocks:
+                            if f"blocks.{block}" in name:
+                                lora_params.append(name.replace(".weight", ""))
+    
+    # if args.lora_target == "attn":
+        # for name, param in diffusion_model.named_parameters():
+            # if name.endswith(".weight"):
+                # if args.lora_target in name and ".norm_" not in name:
+                    # lora_params.append(name.replace(".weight", ""))
     
     # elif args.lora_target == "all-linear":
     
-    else: raise NotImplementedError(f"{args.lora_target}")
+    # else: raise NotImplementedError(f"{args.lora_target}")
     
     lora_config = LoraConfig(
         r = args.lora_rank,
@@ -337,6 +350,7 @@ def main(args):
     
     # Register the hook onto every trainable parameter
     for p, _ in train_parameters:
+        p.register_hook(lambda grad: torch.clamp(grad, -args.clip_grad, args.clip_grad))
         p.register_post_accumulate_grad_hook(optimizer_hook)
     
     context_negative = load_file(args.distill_negative)["context"].to(dtype=torch.bfloat16, device=device)
@@ -590,12 +604,24 @@ def parse_args():
         default = None,
         help = "LoRA checkpoint to load instead of random init, must be the same rank and target layers",
     )
+    # parser.add_argument(
+        # "--lora_target",
+        # type = str,
+        # default = "attn",
+        # choices=["attn", "all-linear"],
+        # help = "layers to target with LoRA, default is attention only",
+    # )
     parser.add_argument(
-        "--lora_target",
+        "--lora_targets",
         type = str,
-        default = "attn",
-        choices=["attn", "all-linear"],
-        help = "layers to target with LoRA, default is attention only",
+        default = "self_attn, cross_attn",
+        help = "layers to target with LoRA, default is self attention only",
+    )
+    parser.add_argument(
+        "--lora_blocks",
+        type = str,
+        default = None,
+        help = "blocks to target with LoRA, default is all blocks, otherwise comma separated string of block numbers",
     )
     parser.add_argument(
         "--control_lora",
@@ -642,6 +668,12 @@ def parse_args():
         "--gradient_checkpointing",
         action = "store_true",
         help = "use gradient checkpointing to reduce memory usage at the cost of speed",
+    )
+    parser.add_argument(
+        "--clip_grad",
+        type = float,
+        default = 1.0,
+        help = "Clip gradients at +- this value (at each parameter via hook)",
     )
     parser.add_argument(
         "--learning_rate",

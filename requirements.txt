@@ -12,3 +12,4 @@ einops
 imageio
 imageio-ffmpeg
 opencv-python
+qwen-vl-utils[decord]
