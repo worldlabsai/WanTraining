@@ -4,7 +4,6 @@ import math
 import torch
 import torch.amp as amp
 import torch.nn as nn
-import torch.utils.checkpoint as checkpoint
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import PeftAdapterMixin
@@ -586,20 +585,20 @@ class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
-        # arguments
-        kwargs = dict(
-            e=e0,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.freqs,
-            context=context,
-            context_lens=context_lens)
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+            return custom_forward
 
         for block in self.blocks:
             if x.requires_grad and self.gradient_checkpointing:
-                x = checkpoint.checkpoint(lambda inp: block(inp, **kwargs), x, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x, e0, seq_lens, grid_sizes, self.freqs, context, context_lens,
+                    use_reentrant=False,
+                )
             else:
-                x = block(x, **kwargs)
+                x = block(x, e0, seq_lens, grid_sizes, self.freqs, context, context_lens)
 
         # head
         x = self.head(x, e)

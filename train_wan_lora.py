@@ -339,24 +339,24 @@ def main(args):
     
     print(f"total trainable parameters: {total_parameters:,}")
     
+    # optimizer = bnb.optim.AdamW8bit(
+        # [p for p, _ in train_parameters],
+        # lr=args.learning_rate,
+    # )
+    
     # Instead of having just one optimizer, we will have a dict of optimizers
     # for every parameter so we could reference them in our hook.
-    # optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=lr) for p, lr in train_parameters}
-    
-    optimizer = bnb.optim.AdamW8bit(
-        [p for p, _ in train_parameters],
-        lr=args.learning_rate,
-    )
+    optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=lr) for p, lr in train_parameters}
     
     # Define our hook, which will call the optimizer step() and zero_grad()
-    # def optimizer_hook(parameter) -> None:
-        # optimizer_dict[parameter].step()
-        # optimizer_dict[parameter].zero_grad()
+    def optimizer_hook(parameter) -> None:
+        optimizer_dict[parameter].step()
+        optimizer_dict[parameter].zero_grad()
     
     # Register the hook onto every trainable parameter
     for p, _ in train_parameters:
-        p.register_hook(lambda grad: torch.clamp(grad, -args.clip_grad, args.clip_grad))
-        # p.register_post_accumulate_grad_hook(optimizer_hook)
+        # p.register_hook(lambda grad: torch.clamp(grad, -args.clip_grad, args.clip_grad))
+        p.register_post_accumulate_grad_hook(optimizer_hook)
     
     context_negative = load_file(args.distill_negative)["context"].to(dtype=torch.bfloat16, device=device)
     
@@ -457,7 +457,6 @@ def main(args):
         c, f, h, w = conditions["noisy_model_input"][0].shape
         seq_len = math.ceil((h / 2) * (w / 2) * f)
         
-        # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         pred = torch.stack(
             diffusion_model(
                 x = conditions["noisy_model_input"],
@@ -515,8 +514,8 @@ def main(args):
             loss = predict_loss(conditions, log_cfg_loss=True)
             t_writer.add_scalar("loss/train", loss.detach().item(), global_step)
             loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            # optimizer.step()
+            # optimizer.zero_grad()
             
             t_writer.add_scalar("debug/step_time", perf_counter() - start_step, global_step)
             progress_bar.update(1)
@@ -676,12 +675,12 @@ def parse_args():
         action = "store_true",
         help = "use gradient checkpointing to reduce memory usage at the cost of speed",
     )
-    parser.add_argument(
-        "--clip_grad",
-        type = float,
-        default = 100.0,
-        help = "Clip gradients at +- this value (at each parameter via hook)",
-    )
+    # parser.add_argument(
+        # "--clip_grad",
+        # type = float,
+        # default = 100.0,
+        # help = "Clip gradients at +- this value (at each parameter via hook)",
+    # )
     parser.add_argument(
         "--learning_rate",
         type = float,
