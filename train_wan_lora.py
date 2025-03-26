@@ -170,7 +170,7 @@ def main(args):
         print(f"WARNING: train subfolder not found, using root folder {train_dataset} as train dataset")
     
     val_dataset = None
-    for subfolder in ["val", "validation", "test"]:
+    for subfolder in ["val", "validation", "eval", "test"]:
         subfolder_path = os.path.join(args.dataset, subfolder)
         if os.path.exists(subfolder_path):
             val_dataset = subfolder_path

@@ -22,7 +22,7 @@ import decord
 decord.bridge.set_bridge('torch')
 
 
-IMAGE_TYPES = [".jpg", ".png"]
+IMAGE_TYPES = [".jpg", ".jpeg", ".png"]
 VIDEO_TYPES = [".mp4", ".mkv", ".mov", ".avi", ".webm"]
 
 

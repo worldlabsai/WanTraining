@@ -85,14 +85,13 @@ def main(args):
                         {
                             "type": "video",
                             "video": video_file,
-                            # "max_pixels": 256 * 192,
                             # "max_pixels": 25_000,
                             # "min_pixels": 10_000,
                             # "fps": 0.5,
-                            "min_pixels": 16 * 28 * 28,
-                            "max_pixels": 32 * 28 * 28,
+                            "min_pixels": 16 * 28 * 28, # 12544
+                            "max_pixels": 64 * 28 * 28, # 50176
                             "min_frames": 4,
-                            "max_frames": 64,
+                            "max_frames": 32,
                         },
                         {
                             "type": "text",
@@ -124,7 +123,7 @@ def main(args):
                     f.write(output_text)
                 
                 free, total = torch.cuda.mem_get_info(device)
-                if free / 1024 ** 3 < 4:
+                if free / 1024 ** 3 < 2:
                     torch.cuda.empty_cache()
 
 
